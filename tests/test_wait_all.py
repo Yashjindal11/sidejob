@@ -120,7 +120,7 @@ def test_wait_all_timeout_raises_even_without_raise_on_failure(make_manager, gat
 
 
 def test_wait_all_includes_queued_and_retrying(make_manager, gate):
-    m = make_manager(max_workers=1)
+    m = make_manager(max_attempts=3, max_workers=1)
     g = gate()
     blocker = m.parallel_job(g)
     flaky = Flaky(1, ConnectionError("x"))

@@ -86,7 +86,7 @@ def test_shutdown_waits_for_running_and_queued(make_manager, gate):
 def test_shutdown_cancel_pending(make_manager, gate):
     import threading
 
-    m = make_manager(max_workers=1, retry_backoff=30)
+    m = make_manager(max_attempts=3, max_workers=1, retry_backoff=30)
     flaky_fn = Flaky(5, ConnectionError("x"))
     flaky = m.parallel_job(flaky_fn, required=False)
     wait_until(lambda: m.get_status(flaky) is JobStatus.RETRYING)  # waiting 30s for a retry

@@ -54,6 +54,18 @@ class JobCancelledError(SidejobError):
         self.job_id = job_id
 
 
+class JobInterrupted(BaseException):
+    """Raised *inside* a running job's thread by :meth:`JobManager.interrupt`.
+
+    It derives from ``BaseException`` (like ``KeyboardInterrupt``) so that
+    ``except Exception:`` blocks in job code do not swallow it. ``finally``
+    blocks and ``with`` statements still run while it propagates.
+    """
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*(args or ("job interrupted by interrupt()",)))
+
+
 class WaitTimeoutError(SidejobError, TimeoutError):
     """Waiting for job(s) exceeded the allowed time.
 

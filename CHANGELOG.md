@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-17
+
+### Added
+
+- `manager.interrupt(job)` / `job.interrupt()`: stop a job immediately, even
+  while it is running. It raises `sidejob.JobInterrupted` inside the job's
+  thread (CPython) after running its `on_cancel` hooks, waits briefly, and
+  returns the job's status. Interrupted jobs are never retried.
+- `manager.job(job_id)` returns a `Job` handle for an ID, for example
+  `manager.job(job_id).interrupt()`.
+
+### Changed
+
+- **Retries are now off by default** (`max_attempts=1`). Enable them with
+  `initialize(retries=N)`, per job with `parallel_job(..., retries=N)`, or with
+  a `RetryPolicy`. To keep the 0.1.0 behavior, use
+  `initialize(max_attempts=3)`.
+
 ## [0.1.0] - 2026-10-16
 
 ### Added
@@ -31,4 +49,5 @@ uses [Semantic Versioning](https://semver.org/).
   attempt tracebacks release their frames, `history_limit=` evicts old
   COMPLETED jobs, and `clear_history()` frees memory on demand.
 
+[0.2.0]: https://github.com/Yashjindal11/sidejob/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Yashjindal11/sidejob/releases/tag/v0.1.0

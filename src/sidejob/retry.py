@@ -36,7 +36,8 @@ class RetryPolicy:
 
     Args:
         max_attempts: Maximum *total* attempts, including the first one (>= 1).
-            ``max_attempts=3`` means "1 attempt + up to 2 retries".
+            The default, ``1``, means no retries. ``max_attempts=3`` means
+            "1 attempt + up to 2 retries".
         backoff: Delay in seconds before the first retry.
         multiplier: Each further retry waits ``multiplier`` times longer.
         max_backoff: Upper bound for a single delay, in seconds.
@@ -50,7 +51,7 @@ class RetryPolicy:
     Only subclasses of ``Exception`` are ever retried.
     """
 
-    max_attempts: int = 3
+    max_attempts: int = 1
     backoff: float = 2.0
     multiplier: float = 2.0
     max_backoff: float = 60.0

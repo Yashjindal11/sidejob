@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sidejob"
-version = "0.1.0"
+version = "0.2.0"
 description = "Simple, observable, fail-loud background jobs for data analysts (threads, retries, mandatory wait_all barrier)."
 readme = "README.md"
 license = "MIT"

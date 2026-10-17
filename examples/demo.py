@@ -4,8 +4,8 @@
 
 Shows: parallel jobs, a retry that succeeds, an optional job failing without
 breaking the workflow, a required job failing and *blocking* the success
-marker, cooperative cancellation of a running job, and the structured history
-you can inspect afterwards.
+marker, cooperative cancellation and an immediate interrupt of running jobs,
+and the structured history you can inspect afterwards.
 """
 
 from __future__ import annotations
@@ -54,6 +54,16 @@ def long_export(n_chunks: int) -> int:
         sidejob.check_cancelled()
         sidejob.sleep(0.1)  # stands in for writing one chunk; wakes up on cancel
     return n_chunks
+
+
+def stubborn_report(rows: list) -> float:
+    """Never checks for cancellation and swallows ordinary errors."""
+    total = 0.0
+    while True:
+        try:
+            total += sum(rows) / len(rows)
+        except Exception:
+            pass
 
 
 def analyze(rows: list) -> dict:
@@ -114,6 +124,12 @@ def main() -> None:
         f"\n>>> long export ended as {final.status.value} after {final.duration:.2f}s "
         f"(overdue={final.overdue})\n"
     )
+
+    print("=== Run 4: interrupt a job that never checks for cancellation ===")
+    report = manager.parallel_job(stubborn_report, rows, required=False)
+    sidejob.sleep(0.2)  # it is busy now
+    status = manager.job(report.id).interrupt()
+    print(f"\n>>> manager.job({report.id!r}).interrupt() -> {status.value}\n")
 
     print("=== Inspecting history ===")
     failed = manager.get_run(upload)

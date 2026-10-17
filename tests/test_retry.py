@@ -12,13 +12,13 @@ from sidejob import JobStatus, RetryPolicy
 # ----------------------------------------------------------------- policy unit tests
 
 
-def test_policy_defaults():
+def test_policy_defaults_no_retries():
     p = RetryPolicy()
-    assert p.max_attempts == 3 and p.retries == 2
+    assert p.max_attempts == 1 and p.retries == 0  # retries are opt-in
     assert p.backoff == 2.0
     m = sidejob.initialize(log_to_console=False)
     try:
-        assert m.retry_policy.max_attempts == 3
+        assert m.retry_policy.max_attempts == 1
         assert m.retry_policy.backoff == 2.0
     finally:
         m.shutdown()
@@ -160,6 +160,18 @@ def test_permanent_error_not_retried(make_manager):
     assert flaky.calls == 1
     assert run.attempts[0].retry_decision == "not_retryable"
     assert "KeyError" in run.attempts[0].traceback
+
+
+def test_retryable_error_not_retried_unless_enabled(make_manager):
+    m = make_manager()
+    flaky = Flaky(failures=1, exc=ConnectionError("blip"))
+    run = m.wait(m.parallel_job(flaky), timeout=5)
+    assert run.status is JobStatus.FAILED and flaky.calls == 1
+    assert run.attempts[0].retry_decision == "exhausted"
+    enabled = make_manager(retries=1)
+    assert (
+        enabled.get_result(enabled.parallel_job(Flaky(1, ConnectionError("x"))), timeout=5) == "ok"
+    )
 
 
 def test_unlisted_error_not_retried_by_default(make_manager):

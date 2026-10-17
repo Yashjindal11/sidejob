@@ -176,7 +176,7 @@ def test_workflow_error_requests_cancellation_of_running_jobs(make_manager):
 
 
 def test_retry_backoff_does_not_hold_a_worker(make_manager):
-    m = make_manager(max_workers=1, retry_backoff=30)
+    m = make_manager(max_attempts=3, max_workers=1, retry_backoff=30)
     flaky = m.parallel_job(Flaky(5, ConnectionError("down")), required=False)
     wait_until(lambda: m.get_status(flaky) is JobStatus.RETRYING)
     other = m.parallel_job(lambda: "ran during the backoff")
@@ -186,7 +186,7 @@ def test_retry_backoff_does_not_hold_a_worker(make_manager):
 
 
 def test_retry_is_redispatched_to_the_pool(make_manager):
-    m = make_manager(max_workers=1, retry_backoff=0.05)
+    m = make_manager(max_attempts=3, max_workers=1, retry_backoff=0.05)
     threads = []
 
     def record_thread():
@@ -201,7 +201,7 @@ def test_retry_is_redispatched_to_the_pool(make_manager):
 
 
 def test_scheduler_thread_exits_when_idle(make_manager):
-    m = make_manager(retry_backoff=0.01)
+    m = make_manager(max_attempts=3, retry_backoff=0.01)
     m.get_result(m.parallel_job(Flaky(1, ConnectionError("x"))), timeout=5)
     wait_until(lambda: m._scheduler is None)
     assert not any(
@@ -210,7 +210,7 @@ def test_scheduler_thread_exits_when_idle(make_manager):
 
 
 def test_shutdown_without_wait_still_runs_scheduled_retry(make_manager):
-    m = make_manager(retry_backoff=0.1)
+    m = make_manager(max_attempts=3, retry_backoff=0.1)
     job = m.parallel_job(Flaky(1, ConnectionError("x"), result="late success"))
     wait_until(lambda: m.get_status(job) is JobStatus.RETRYING)
     assert m.shutdown(wait=False) is None
@@ -237,7 +237,7 @@ def test_inputs_are_released_after_completion(make_manager):
 
 
 def test_retried_attempt_tracebacks_release_locals(make_manager):
-    m = make_manager(retry_backoff=0)
+    m = make_manager(max_attempts=3, retry_backoff=0)
     refs = []
 
     class Big:
@@ -302,7 +302,7 @@ def test_clear_history(make_manager):
 
 def test_job_context_for_idempotent_retries(make_manager):
     """A retry can detect that an earlier attempt's write already committed."""
-    m = make_manager(retry_backoff=0)
+    m = make_manager(max_attempts=3, retry_backoff=0)
     table = {}
     seen = []
 
@@ -330,7 +330,7 @@ def test_job_context_for_idempotent_retries(make_manager):
 
 def test_done_is_signalled_only_after_cancel_is_logged(make_manager):
     """A worker racing with cancel() must not set ``done`` before CANCELLED is logged."""
-    m = make_manager(retry_backoff=30)
+    m = make_manager(max_attempts=3, retry_backoff=30)
 
     class Pause(logging.Handler):
         def __init__(self):

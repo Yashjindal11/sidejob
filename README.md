@@ -45,6 +45,7 @@ write_success_marker()                     # reached only if every required job 
 - [Retries](#retries)
 - [Logging and observability](#logging-and-observability)
 - [Timeouts, deadlines and cancellation](#timeouts-deadlines-and-cancellation)
+- [Interrupting a running job](#interrupting-a-running-job)
 - [Stopping running jobs (cooperative cancellation)](#stopping-running-jobs-cooperative-cancellation)
 - [Memory and history retention](#memory-and-history-retention)
 - [Shutdown](#shutdown)
@@ -107,7 +108,7 @@ There are no runtime dependencies.
 | Concept | What it is |
 |---|---|
 | `JobManager` | Returned by `sidejob.initialize()`. Owns **one bounded `ThreadPoolExecutor`**, a thread-safe job registry, retry defaults and a logger. Managers are independent of each other. |
-| `Job` | Lightweight handle returned by `parallel_job()`: `job.id`, `job.status`, `job.result()`, `job.wait()`, `job.cancel()`, `job.snapshot()`. |
+| `Job` | Lightweight handle returned by `parallel_job()`: `job.id`, `job.status`, `job.result()`, `job.wait()`, `job.cancel()`, `job.interrupt()`, `job.snapshot()`. Get one from an ID with `manager.job(job_id)`. |
 | `JobRun` | Immutable snapshot of a job's metadata, attempts and events. |
 | `Workflow` | `manager.workflow()` context. `run.parallel_job()` submits jobs that belong to the workflow. `run.wait_all()` checks **only those jobs**. |
 | `required` | Defaults to **`True`**. Required jobs decide whether the workflow succeeds. Optional failures are logged and recorded but don't fail it. |
@@ -143,7 +144,7 @@ sidejob.initialize(
     retries=None,               # retries AFTER the first attempt  (retries=2 -> 3 attempts)
     retry_backoff=None,         # seconds before the first retry (default 2.0)
     *,
-    max_attempts=None,          # TOTAL attempts incl. the first (default 3); exclusive with retries
+    max_attempts=None,          # TOTAL attempts incl. the first (default 1 = no retries)
     backoff_multiplier=None,    # default 2.0
     max_backoff=None,           # default 60.0 seconds
     jitter=None,                # 0..1 fraction, default 0
@@ -160,8 +161,12 @@ sidejob.initialize(
 
 > **`retries` vs `max_attempts`.** `retries=3` means *3 retries after the first
 > attempt*, so **4 attempts in total**. `max_attempts=3` means *3 attempts in
-> total*. Passing both raises `ValueError`. The default is `max_attempts=3`
-> with a 2-second initial backoff.
+> total*. Passing both raises `ValueError`.
+>
+> **Retries are off by default** (`max_attempts=1`). Turn them on in the
+> settings, for the whole manager (`initialize(retries=2)`) or per job
+> (`parallel_job(f, retries=2)`). The first retry waits 2 seconds by default
+> (`retry_backoff=`).
 
 ### Submitting jobs
 
@@ -193,6 +198,8 @@ a workflow that hasn't been entered, or has already exited, raises
 | `get_run(job)` | `JobRun` snapshot. |
 | `get_status(job)` | `JobStatus` (non-blocking). |
 | `get_result(job, timeout=None)` | Waits, then returns the result. Raises the job's **original exception** if it `FAILED`, `JobCancelledError` if it was cancelled, and `WaitTimeoutError` on timeout (the job keeps running). |
+| `job(job_id)` | `Job` handle for an ID, e.g. `manager.job("0003-1a2b3c4d").interrupt()`. |
+| `interrupt(job, timeout=5.0)` | Stop a job now, even mid-run. Returns its status. See [Interrupting a running job](#interrupting-a-running-job). |
 | `wait(job, timeout=None)` | Waits until terminal and returns the `JobRun`. Does not raise on job failure. Raises `WaitTimeoutError` on timeout. |
 | `get_all_runs(status=None, *, required=None)` | All snapshots in submission order. `status` can be a `JobStatus`, a string (`"FAILED"`), or an iterable of them. |
 | `get_failed_runs(*, include_cancelled=False)` | Snapshots of `FAILED` (and optionally `CANCELLED`) jobs. |
@@ -302,7 +309,7 @@ SidejobError
 from sidejob import RetryPolicy
 
 RetryPolicy(
-    max_attempts=3,       # total attempts including the first
+    max_attempts=1,       # total attempts including the first; 1 = no retries (default)
     backoff=2.0,          # delay before the 1st retry
     multiplier=2.0,       # 2s, 4s, 8s, ...
     max_backoff=60.0,     # cap per delay
@@ -313,13 +320,16 @@ RetryPolicy(
 )                                    # ArithmeticError, AssertionError, ImportError, NotImplementedError, MemoryError
 ```
 
-A failed attempt is retried only if **all** of these hold:
+Retries are **opt-in**: nothing is retried unless you set `retries=` /
+`max_attempts=` in `initialize()`, on a job, or in a `RetryPolicy`.
+Then a failed attempt is retried only if **all** of these hold:
 
 1. The error is an `Exception`, not `KeyboardInterrupt` or `SystemExit`.
 2. It is not an instance of `never_retry`.
 3. It matches `retry_if(exc)` if that is set, otherwise `retry_on`.
 4. The attempt budget isn't used up.
-5. The manager is not shutting down with `cancel_pending=True`.
+5. The job was not cancelled or interrupted, and the manager is not shutting
+   down with `cancel_pending=True`.
 
 Every attempt records its exception, traceback, timestamps, the retry
 decision and the delay. Programming errors (`TypeError`, `KeyError`, …) fail
@@ -443,6 +453,50 @@ either cancelled or started, never both.
 
 ---
 
+## Interrupting a running job
+
+To stop a job **now**, while it is running:
+
+```python
+job = run.parallel_job(upload_to_redshift, df, "analytics_table")
+...
+job.interrupt()                              # with the handle
+manager.job("0003-1a2b3c4d").interrupt()     # or by ID, e.g. from get_all_runs()
+manager.interrupt(job, timeout=10)           # same thing; returns the job's status
+```
+
+What `interrupt()` does:
+
+1. **Cancellation request.** Like `cancel()`: a queued job, or one waiting to
+   retry, is cancelled at once. A running job's `on_cancel` hooks run, which
+   can abort a blocking database or Spark call.
+2. **Raises `sidejob.JobInterrupted` inside the job's thread.** Python code
+   stops at its very next step, without needing to check anything. Like
+   `KeyboardInterrupt`, it is a `BaseException`, so `except Exception:` blocks
+   in your code don't swallow it. `finally` blocks and `with` statements still
+   run, so connections are closed and transactions rolled back as the
+   exception propagates.
+3. **Waits up to `timeout` seconds (default 5)** and returns the job's status:
+   * `CANCELLED`: stopped. Interrupted jobs are **never retried**.
+   * `COMPLETED` or `FAILED`: it ended on its own before the interrupt
+     landed.
+   * `RUNNING`: it is stuck in one call that Python can't interrupt, such as
+     a long network read, a database driver call, or `time.sleep`. It stops
+     as soon as that call returns. To make those calls interruptible too,
+     register a cancel hook in the job, e.g. `sidejob.on_cancel(conn.cancel)`.
+
+An interrupted **required** job makes `wait_all()` raise `JobsFailedError`, so
+a stopped upload can never be mistaken for a finished one.
+
+> **Use interrupt deliberately.** It works on CPython, the standard Python.
+> On other implementations it falls back to a cancellation request and logs a
+> warning. If the interrupt lands *inside* a `finally`/`__exit__` cleanup
+> block, that cleanup is cut short. Keep writes transactional (one commit at
+> the end) so an interrupted job leaves nothing half-written. For long loops
+> you write yourself, `sidejob.check_cancelled()` is the gentler alternative.
+
+---
+
 ## Stopping running jobs (cooperative cancellation)
 
 Python has no safe way to kill a thread: killing one could leave locks,
@@ -492,8 +546,8 @@ Rules:
   propagated.
 * All helpers are **no-ops outside a job** (`sidejob.sleep` becomes
   `time.sleep`), so the same function also works when called directly.
-* Code that never checks still can't be stopped. It runs to completion and
-  keeps its worker until then.
+* Code that never checks for cancellation can still be stopped with
+  [`interrupt()`](#interrupting-a-running-job).
 
 ---
 
@@ -666,12 +720,11 @@ if __name__ == "__main__":
   connection inside each job, or use a thread-safe pool. Many connections at
   once can hit warehouse concurrency limits, so size `max_workers`
   accordingly.
-* **Running threads cannot be killed.** Stopping running work needs the
-  job's cooperation (`check_cancelled`, `sleep`, or `on_cancel` hooks; see
-  [above](#stopping-running-jobs-cooperative-cancellation)). Code that never
-  checks, such as a single long C call without a cancel hook, runs to
-  completion. Timeouts bound how long you *wait*, and Python waits for running
-  jobs at interpreter exit.
+* **Interrupts take effect between Python steps.** `interrupt()` stops Python
+  code immediately, but a thread blocked inside one C-level call (a network
+  read, a driver call, `time.sleep`) stops only when that call returns, unless
+  an `on_cancel` hook aborts it. Timeouts bound how long you *wait*, and Python
+  waits for running jobs at interpreter exit.
 * **No exactly-once guarantee.** Retries can repeat side effects. Use
   idempotent writes and `current_job().is_retry` / `idempotency_key` (see
   [Retries](#retries)).

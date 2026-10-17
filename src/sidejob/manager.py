@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import heapq
 import itertools
 import logging
+import platform
 import sys
 import threading
 import time
@@ -33,6 +35,7 @@ from ._status import JobStatus
 from .context import JobContext, _set_context, current_job
 from .errors import (
     JobCancelledError,
+    JobInterrupted,
     JobsFailedError,
     ManagerShutdownError,
     SidejobError,
@@ -65,6 +68,27 @@ def _callable_name(func: Callable[..., Any]) -> str:
         func = func.func
     name = getattr(func, "__qualname__", None) or getattr(func, "__name__", None)
     return str(name) if name else type(func).__name__
+
+
+#: Whether interrupt() can raise inside a running thread (CPython only).
+INTERRUPT_SUPPORTED = platform.python_implementation() == "CPython" and hasattr(ctypes, "pythonapi")
+
+
+def _async_raise(ident: int, exc_type: Optional[Type[BaseException]]) -> int:
+    """Schedule ``exc_type`` in thread ``ident`` (``None`` clears a pending one).
+
+    Uses CPython's ``PyThreadState_SetAsyncExc``. The exception is raised the
+    next time that thread executes Python bytecode. Returns the number of
+    threads affected.
+    """
+    if not INTERRUPT_SUPPORTED:
+        return 0
+    arg = ctypes.py_object(exc_type) if exc_type is not None else None
+    n = int(ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), arg))
+    if n > 1:  # pragma: no cover - would mean an invalid thread id; undo
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+        return 0
+    return n
 
 
 def _release_frames(exc: BaseException) -> None:
@@ -182,6 +206,13 @@ class _JobRecord:
         self.cancel_event = threading.Event()
         self.cancel_reason: Optional[str] = None
         self.cancel_callbacks: List[Callable[[], Any]] = []
+        # Thread ident while the job's own function runs; interrupt() only targets
+        # a thread while this is set, so the exception can't hit sidejob or another job.
+        self.worker_ident: Optional[int] = None
+        # Set by interrupt(); checked when arming, so an interrupt that arrives
+        # between RUNNING and the function call is not lost.
+        self.interrupt_requested = False
+        self.interrupt_injected = False
         self.future: Optional[Future[None]] = None
 
     def release_inputs(self) -> None:
@@ -232,6 +263,9 @@ class Job:
 
     def cancel(self) -> bool:
         return self._manager.cancel(self)
+
+    def interrupt(self, timeout: Optional[float] = 5.0) -> JobStatus:
+        return self._manager.interrupt(self, timeout=timeout)
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Job) and other._manager is self._manager and other.id == self.id
@@ -533,32 +567,71 @@ class JobManager:
         assert func is not None
 
         prev_ctx = _set_context(JobContext(self, rec, n))
-        try:
-            result = func(*args, **kwargs)
-        except BaseException as exc:
-            _set_context(prev_ctx)
-            del func, args, kwargs
-            return self._attempt_failed(rec, att, exc)
-        else:
-            _set_context(prev_ctx)
-            del func, args, kwargs
-            with self._lock:
-                att.close(succeeded=True)
-                rec.cancel_callbacks.clear()
-                was_cancel_requested = rec.cancel_event.is_set()
-                self._finalize(rec, JobStatus.COMPLETED, result=result)
-                overdue_msg = self._overdue_check_locked(rec)
-                duration = rec.finished_mono - rec.started_mono  # type: ignore[operator]
-            if overdue_msg:
-                self._log(logging.WARNING, rec, overdue_msg, attempt=n)
-            note = " (cancellation had been requested, but the job finished normally)"
-            self._log(
-                logging.INFO,
-                rec,
-                f"COMPLETED in {duration:.3f}s" + (note if was_cancel_requested else ""),
-                attempt=n,
-            )
-            return None, True
+        ok, value = self._invoke(rec, func, args, kwargs)
+        _set_context(prev_ctx)
+        del func, args, kwargs
+        if not ok:
+            return self._attempt_failed(rec, att, value)
+        result = value
+        with self._lock:
+            att.close(succeeded=True)
+            rec.cancel_callbacks.clear()
+            was_cancel_requested = rec.cancel_event.is_set()
+            self._finalize(rec, JobStatus.COMPLETED, result=result)
+            overdue_msg = self._overdue_check_locked(rec)
+            duration = rec.finished_mono - rec.started_mono  # type: ignore[operator]
+        if overdue_msg:
+            self._log(logging.WARNING, rec, overdue_msg, attempt=n)
+        note = " (cancellation had been requested, but the job finished normally)"
+        self._log(
+            logging.INFO,
+            rec,
+            f"COMPLETED in {duration:.3f}s" + (note if was_cancel_requested else ""),
+            attempt=n,
+        )
+        return None, True
+
+    def _invoke(
+        self,
+        rec: _JobRecord,
+        func: Callable[..., Any],
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> Tuple[bool, Any]:
+        """Call the job function, keeping interrupt() confined to it.
+
+        Returns ``(True, result)`` or ``(False, exception)``. interrupt() injects
+        at most one ``JobInterrupted`` per job, only while ``worker_ident`` is set
+        (under the lock). If it surfaces just outside ``func`` it is caught by the
+        loop below, and an injection not yet delivered is cleared while disarming,
+        so it can never escape into sidejob's code or the next job on this worker.
+        """
+        ident = threading.get_ident()
+        outcome: Optional[Tuple[bool, Any]] = None
+        armed = False
+        while True:
+            try:
+                if not armed:
+                    with self._lock:
+                        rec.worker_ident = ident
+                        preempted = rec.interrupt_requested
+                    armed = True
+                    if preempted and outcome is None:
+                        outcome = (False, JobInterrupted())
+                if outcome is None:
+                    try:
+                        outcome = (True, func(*args, **kwargs))
+                    except BaseException as exc:
+                        outcome = (False, exc)
+                with self._lock:
+                    rec.worker_ident = None
+                    if rec.interrupt_injected:
+                        _async_raise(ident, None)
+                return outcome
+            except JobInterrupted as exc:
+                armed = True
+                if outcome is None:
+                    outcome = (False, exc)
 
     def _attempt_failed(
         self, rec: _JobRecord, att: _AttemptState, exc: BaseException
@@ -1270,6 +1343,78 @@ class JobManager:
         rec = self._resolve(job)
         return self._cancel_record(rec, reason="cancel() requested")
 
+    def interrupt(self, job: JobRef, timeout: Optional[float] = 5.0) -> JobStatus:
+        """Stop a job now, including a RUNNING one, and return its resulting status.
+
+        1. Same as :meth:`cancel`: a QUEUED/RETRYING job becomes CANCELLED at once;
+           for a RUNNING job a cancellation request is made and its
+           :func:`sidejob.on_cancel` hooks run (use them to abort blocking
+           database/Spark/network calls).
+        2. For a RUNNING job, :class:`sidejob.JobInterrupted` is raised *inside*
+           the job's thread (CPython). Python code stops at its next bytecode,
+           even inside ``except Exception`` blocks. A thread blocked in a single
+           C call (socket read, ``time.sleep``, a driver call) is interrupted as
+           soon as that call returns, which an ``on_cancel`` hook can force.
+        3. Waits up to ``timeout`` seconds (``0`` = don't wait) for the job to
+           finish, then returns its status: ``CANCELLED`` once stopped,
+           ``RUNNING`` if still inside a blocking call (it stops when the call
+           returns), or ``COMPLETED``/``FAILED`` if it ended first.
+
+        An interrupted job is never retried. Its ``finally`` blocks and ``with``
+        exits run normally, but if the exception lands *inside* cleanup code that
+        cleanup is cut short, so prefer transactional writes (see the README).
+        A job cannot interrupt itself.
+        """
+        _validate_timeout(timeout)
+        rec = self._resolve(job)
+        ctx = current_job()
+        if ctx is not None and ctx._rec is rec:
+            raise SidejobError(
+                f"job {rec.job_id} cannot interrupt itself; raise an exception or return instead"
+            )
+        self._cancel_records(lambda: [rec], reason="interrupt() requested")
+        injected = False
+        with self._lock:
+            ident = rec.worker_ident
+            if rec.status is JobStatus.RUNNING and INTERRUPT_SUPPORTED:
+                rec.interrupt_requested = True
+                if (
+                    ident is not None
+                    and not rec.interrupt_injected
+                    and _async_raise(ident, JobInterrupted) == 1
+                ):
+                    rec.interrupt_injected = True
+                    injected = True
+                    self._add_event(rec, "interrupted", "JobInterrupted raised in the job's thread")
+        if injected:
+            self._log(logging.WARNING, rec, "INTERRUPT: raised JobInterrupted in the job's thread")
+        elif rec.interrupt_requested and not rec.interrupt_injected:
+            self._log(logging.WARNING, rec, "INTERRUPT: the job will stop before its function runs")
+        elif rec.status is JobStatus.RUNNING and not INTERRUPT_SUPPORTED:
+            self._log(
+                logging.WARNING,
+                rec,
+                f"interrupt() is not supported on {platform.python_implementation()}; "
+                "only cooperative cancellation was requested",
+            )
+        if timeout != 0:
+            rec.done.wait(timeout)
+        with self._lock:
+            status = rec.status
+        if not status.is_terminal:
+            self._log(
+                logging.WARNING,
+                rec,
+                f"still {status.value} after interrupt(timeout={timeout}): it is probably "
+                "blocked in a call that Python cannot interrupt (network/database/C code). "
+                "It stops when that call returns; register sidejob.on_cancel(...) to abort it.",
+            )
+        return status
+
+    def job(self, job_id: str) -> Job:
+        """Get a :class:`Job` handle from a job ID, e.g. ``manager.job(id).interrupt()``."""
+        return Job(self, self._resolve(job_id))
+
     def _cancel_record(self, rec: _JobRecord, reason: str) -> bool:
         return self._cancel_records(lambda: [rec], reason)[0]
 
@@ -1479,8 +1624,9 @@ def initialize(
         log_level: Level for this manager's logger (``None`` leaves it unchanged).
         retries: Retries *after* the first attempt (``retries=2`` -> 3 attempts).
         retry_backoff: Seconds before the first retry (default 2.0).
-        max_attempts: Total attempts including the first (default 3). Mutually
-            exclusive with ``retries``.
+        max_attempts: Total attempts including the first. Mutually exclusive
+            with ``retries``. Default: 1, i.e. **no retries** unless you enable
+            them with ``retries=`` or ``max_attempts=``.
         backoff_multiplier, max_backoff, jitter, retry_on, retry_if, never_retry:
             See :class:`RetryPolicy`.
         retry_policy: A complete :class:`RetryPolicy`; cannot be combined with

@@ -23,6 +23,7 @@ from .context import (
 )
 from .errors import (
     JobCancelledError,
+    JobInterrupted,
     JobsFailedError,
     ManagerShutdownError,
     SidejobError,
@@ -37,7 +38,7 @@ from .records import AttemptRecord, JobEvent, JobRun, WaitReport
 from .retry import DEFAULT_NEVER_RETRY, DEFAULT_RETRYABLE, RetryPolicy
 from .workflow import Workflow
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DEFAULT_NEVER_RETRY",
@@ -47,6 +48,7 @@ __all__ = [
     "JobCancelledError",
     "JobContext",
     "JobEvent",
+    "JobInterrupted",
     "JobManager",
     "JobRun",
     "JobStatus",

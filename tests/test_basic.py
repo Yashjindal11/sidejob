@@ -26,7 +26,7 @@ def test_success_and_return_value(make_manager):
     assert run.name == "add"
     assert run.required is True
     assert run.result == 5
-    assert run.attempt == 1 and run.max_attempts == 3
+    assert run.attempt == 1 and run.max_attempts == 1  # no retries by default
     assert isinstance(run.submitted_at, datetime) and run.submitted_at.tzinfo is not None
     assert run.submitted_at <= run.started_at <= run.finished_at
     assert run.duration is not None and run.duration >= 0
@@ -102,7 +102,7 @@ def test_status_transitions_queued_running_completed(make_manager, gate):
 
 
 def test_status_retrying_during_backoff(make_manager):
-    m = make_manager(retry_backoff=30)
+    m = make_manager(max_attempts=3, retry_backoff=30)
     calls = []
 
     def fails():
@@ -236,7 +236,7 @@ def test_logging_includes_job_id_and_attempt(make_manager, caplog):
     msgs = [r for r in caplog.records if getattr(r, "sidejob_job_id", None) == job.id]
     text = [r.getMessage() for r in msgs]
     assert any("submitted" in t for t in text)
-    assert any("attempt 1/3: started" in t for t in text)
+    assert any("attempt 1/1: started" in t for t in text)
     assert any("COMPLETED" in t for t in text)
     assert all(job.id in t and "[adder]" in t for t in text)
     assert all(r.name == "sidejob.logtest" for r in msgs)
