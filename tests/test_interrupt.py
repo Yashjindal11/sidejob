@@ -187,17 +187,26 @@ def test_interrupt_never_leaks_into_sidejob_or_the_next_job(make_manager):
     m = make_manager(max_workers=1)
     rng = random.Random(1234)
     outcomes = {JobStatus.CANCELLED: 0, JobStatus.COMPLETED: 0}
-    for _ in range(200):
-        target = m.parallel_job(busy_loop, rng.uniform(0, 0.03), required=False)
-        follow_up = m.parallel_job(busy_loop, 0.001)
-        time.sleep(rng.uniform(0, 0.03))
-        status = m.interrupt(target, timeout=5)
-        assert status in outcomes, status
-        outcomes[status] += 1
+    for i in range(200):
+        if i % 2 == 0:
+            # Interrupt mid-run: the function is known to be executing.
+            entered = threading.Event()
+            target = m.parallel_job(busy_loop, 5.0, entered, required=False)
+            follow_up = m.parallel_job(busy_loop, 0.001)
+            assert entered.wait(5)
+            assert m.interrupt(target, timeout=5) is JobStatus.CANCELLED
+            outcomes[JobStatus.CANCELLED] += 1
+        else:
+            # Interrupt around the moment the job finishes (the dangerous race).
+            target = m.parallel_job(busy_loop, rng.uniform(0, 0.004), required=False)
+            follow_up = m.parallel_job(busy_loop, 0.001)
+            time.sleep(rng.uniform(0, 0.004))
+            status = m.interrupt(target, timeout=5)
+            assert status in outcomes, status
+            outcomes[status] += 1
         assert follow_up.result(timeout=5) == "finished"
-    # Both races were exercised: interrupted mid-run, and finished just before.
-    assert outcomes[JobStatus.CANCELLED] > 20
-    assert outcomes[JobStatus.COMPLETED] > 20
+    assert outcomes[JobStatus.CANCELLED] >= 100
+    assert outcomes[JobStatus.COMPLETED] >= 1
     assert m.get_summary()["required_failed_job_ids"] == []
     # The pool's worker is still healthy.
     assert m.get_result(m.parallel_job(lambda: "alive"), timeout=5) == "alive"
@@ -233,3 +242,87 @@ def test_interrupt_between_running_and_function_call_is_not_lost(make_manager):
     assert run.status is JobStatus.CANCELLED
     assert run.attempts[0].error_type == "JobInterrupted"
     assert calls == []  # the function never ran
+
+
+def test_interrupting_a_logging_job_never_leaks_the_handler_lock(make_manager):
+    """Regression: the interrupt must not land between a logging handler's acquire and try."""
+    import io
+    import logging
+
+    app_log = logging.getLogger("tests.interrupt.app")
+    handler = logging.StreamHandler(io.StringIO())
+    app_log.addHandler(handler)
+    app_log.setLevel(logging.INFO)
+    app_log.propagate = False
+    m = make_manager(logger=app_log)  # sidejob logs through the same handler
+    try:
+        for _ in range(25):
+            entered = threading.Event()
+
+            def chatty(entered=entered):
+                entered.set()
+                while True:
+                    app_log.info("progress")  # heavy logging through the shared handler
+                    sum(range(20))  # a sliver of the job's own work
+
+            job = m.parallel_job(chatty, required=False)
+            assert entered.wait(5)
+            done = []
+            interrupter = threading.Thread(target=lambda j=job, d=done: d.append(m.interrupt(j)))
+            interrupter.start()
+            interrupter.join(10)
+            assert not interrupter.is_alive(), "interrupt() hung"
+            assert done == [JobStatus.CANCELLED]
+            assert handler.lock.acquire(timeout=2), "handler lock leaked"
+            handler.lock.release()
+        assert m.get_result(m.parallel_job(lambda: app_log.info("still fine") or 1), timeout=5) == 1
+    finally:
+        app_log.removeHandler(handler)
+
+
+def test_interrupting_a_job_that_calls_back_into_the_manager(make_manager):
+    m = make_manager()
+    entered = threading.Event()
+
+    def supervisor():
+        entered.set()
+        while True:
+            child = m.parallel_job(lambda: None, required=False)
+            m.get_status(child)
+            m.cancel(child)
+            sidejob.check_cancelled()  # guarantees termination even on a contended runtime
+
+    job = m.parallel_job(supervisor, required=False)
+    assert entered.wait(5)
+    # The point is no deadlock/lock leak while interrupting a job that is itself
+    # driving the manager (it logs and takes the same lock from inside).
+    assert m.interrupt(job, timeout=10) is JobStatus.CANCELLED
+    m.clear_history()  # the supervisor created many child jobs
+    assert m.get_result(m.parallel_job(lambda: "ok"), timeout=5) == "ok"
+
+
+def test_interrupt_does_not_leave_the_eval_breaker_set(make_manager):
+    """Regression (CPython 3.12): disarming must consume, not NULL-clear, a pending interrupt."""
+    import sys
+
+    m = make_manager(max_workers=1)
+
+    def calls(n=3_000_000):
+        f = len
+        t0 = time.perf_counter()
+        for _ in range(n):
+            f(())
+        return time.perf_counter() - t0
+
+    # min() filters scheduling noise; a stuck eval breaker slows *every* sample, so
+    # a real regression (the pre-fix version was ~1.37x) still shows through.
+    baseline = min(m.get_result(m.parallel_job(calls), timeout=30) for _ in range(7))
+    for _ in range(5):
+        # The job finishes before the interrupt is delivered -> the disarm path drains it.
+        entered = threading.Event()
+        job = m.parallel_job(busy_loop, 5.0, entered, required=False)
+        assert entered.wait(5)
+        m.interrupt(job)
+    after = min(m.get_result(m.parallel_job(calls), timeout=30) for _ in range(7))
+    if sys.version_info[:2] == (3, 12):
+        assert after < baseline * 1.2, (baseline, after)

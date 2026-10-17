@@ -91,6 +91,86 @@ def _async_raise(ident: int, exc_type: Optional[Type[BaseException]]) -> int:
     return n
 
 
+class _DrainInterrupt(BaseException):
+    """Private placeholder used to discard a pending, undelivered interrupt."""
+
+
+def _drain_point() -> None:
+    """A Python call: a pending async exception is delivered at its entry."""
+
+
+def _drain_pending_interrupt(ident: int) -> None:
+    """Discard any undelivered interrupt for the *current* thread.
+
+    Must run on the job's own thread. Instead of clearing with NULL, which on
+    CPython 3.12 leaves the interpreter's eval-breaker flag set and slows every
+    thread, the pending exception is replaced by a private one and consumed here.
+    """
+    try:
+        if _async_raise(ident, _DrainInterrupt) == 1:
+            for _ in range(8):
+                _drain_point()
+    except _DrainInterrupt:
+        pass
+
+
+def _release_leaked_logging_locks() -> None:
+    """Backstop, run on the job's thread after an interrupted attempt.
+
+    Once the job function has exited, this thread cannot legitimately hold a
+    logging lock. If the interrupt landed between a handler's acquire and its
+    ``try`` (a tiny race the safe-point check can't fully close in pure Python),
+    release it so other threads don't deadlock.
+    """
+    locks = [getattr(logging, "_lock", None)]
+    for ref in list(getattr(logging, "_handlerList", [])):
+        handler = ref()
+        if handler is not None:
+            locks.append(getattr(handler, "lock", None))
+    for lock in locks:
+        is_owned = getattr(lock, "_is_owned", None)
+        if is_owned is None:
+            continue
+        try:
+            while is_owned():
+                lock.release()  # type: ignore[union-attr]
+        except RuntimeError:  # pragma: no cover - defensive
+            pass
+
+
+#: Modules whose code must never be interrupted: an exception landing between a
+#: lock acquire and its ``try`` there would leak the lock (e.g. a logging handler).
+_UNSAFE_INTERRUPT_MODULES = (
+    "logging",
+    "threading",
+    "queue",
+    "concurrent.futures",
+    "importlib",
+    "_weakrefset",
+    "weakref",
+    "sidejob",
+)
+
+
+def _at_safe_point(ident: int) -> bool:
+    """True if thread ``ident`` is running the job's own code, not lock-sensitive code.
+
+    Walks the thread's stack from the innermost frame out to sidejob's
+    ``_invoke`` frame (the call into the job function). Called with the GIL
+    held, so the snapshot is current at the moment it is taken.
+    """
+    frame = sys._current_frames().get(ident)
+    while frame is not None:
+        if frame.f_code is _INVOKE_CODE:
+            return True
+        module = frame.f_globals.get("__name__", "") or ""
+        for unsafe in _UNSAFE_INTERRUPT_MODULES:
+            if module == unsafe or module.startswith(unsafe + "."):
+                return False
+        frame = frame.f_back
+    return False  # not inside the job's function at all
+
+
 def _release_frames(exc: BaseException) -> None:
     """Drop local variables held by an exception's traceback (and its chain).
 
@@ -213,6 +293,7 @@ class _JobRecord:
         # between RUNNING and the function call is not lost.
         self.interrupt_requested = False
         self.interrupt_injected = False
+        self.interrupt_polls = 0
         self.future: Optional[Future[None]] = None
 
     def release_inputs(self) -> None:
@@ -602,9 +683,10 @@ class JobManager:
 
         Returns ``(True, result)`` or ``(False, exception)``. interrupt() injects
         at most one ``JobInterrupted`` per job, only while ``worker_ident`` is set
-        (under the lock). If it surfaces just outside ``func`` it is caught by the
-        loop below, and an injection not yet delivered is cleared while disarming,
-        so it can never escape into sidejob's code or the next job on this worker.
+        (under the lock) and when the thread is at a safe point. If it surfaces just
+        outside ``func`` it is caught by the loop below, and an injection not yet
+        delivered is drained while disarming, so it can never escape into
+        sidejob's code or the next job on this worker.
         """
         ident = threading.get_ident()
         outcome: Optional[Tuple[bool, Any]] = None
@@ -626,7 +708,9 @@ class JobManager:
                 with self._lock:
                     rec.worker_ident = None
                     if rec.interrupt_injected:
-                        _async_raise(ident, None)
+                        _drain_pending_interrupt(ident)
+                if rec.interrupt_injected:
+                    _release_leaked_logging_locks()
                 return outcome
             except JobInterrupted as exc:
                 armed = True
@@ -783,6 +867,8 @@ class JobManager:
             rec = entry[3]
             if rec.status.is_terminal:
                 return True
+            if entry[2] == "interrupt":
+                return rec.status is not JobStatus.RUNNING or rec.interrupt_injected
             return entry[2] == "retry" and rec.status is not JobStatus.RETRYING
 
         if any(stale(e) for e in self._timers):
@@ -790,7 +876,7 @@ class JobManager:
             heapq.heapify(self._timers)
 
     def _scheduler_loop(self) -> None:
-        """Fires retry and deadline timers; exits as soon as none are pending."""
+        """Fires retry, deadline and interrupt timers; exits as soon as none are pending."""
         while True:
             fired: List[Tuple[float, int, str, _JobRecord]] = []
             with self._cond:
@@ -810,6 +896,8 @@ class JobManager:
                 try:
                     if kind == "retry":
                         self._dispatch_retry(rec)
+                    elif kind == "interrupt":
+                        self._retry_interrupt(rec)
                     else:
                         self._deadline_reached(rec)
                 except Exception:  # pragma: no cover - defensive
@@ -1360,6 +1448,13 @@ class JobManager:
            ``RUNNING`` if still inside a blocking call (it stops when the call
            returns), or ``COMPLETED``/``FAILED`` if it ended first.
 
+        The exception is only raised while the job's thread is in its own code
+        or ordinary libraries, never while it is inside ``logging``,
+        ``threading``, ``queue``, ``concurrent.futures``, ``importlib`` or
+        sidejob, where it could leak a lock. If the job stays inside such code,
+        the interrupt stays pending and is raised as soon as the job returns to
+        its own code (retried in the background, also after interrupt() returns).
+
         An interrupted job is never retried. Its ``finally`` blocks and ``with``
         exits run normally, but if the exception lands *inside* cleanup code that
         cleanup is cut short, so prefer transactional writes (see the README).
@@ -1373,32 +1468,48 @@ class JobManager:
                 f"job {rec.job_id} cannot interrupt itself; raise an exception or return instead"
             )
         self._cancel_records(lambda: [rec], reason="interrupt() requested")
-        injected = False
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._lock:
-            ident = rec.worker_ident
-            if rec.status is JobStatus.RUNNING and INTERRUPT_SUPPORTED:
-                rec.interrupt_requested = True
-                if (
-                    ident is not None
-                    and not rec.interrupt_injected
-                    and _async_raise(ident, JobInterrupted) == 1
-                ):
-                    rec.interrupt_injected = True
-                    injected = True
-                    self._add_event(rec, "interrupted", "JobInterrupted raised in the job's thread")
-        if injected:
+            outcome = self._try_interrupt_locked(rec)
+        # While waiting anyway, poll for a safe point faster than the scheduler does.
+        while outcome == "pending" and (deadline is None or time.monotonic() < deadline):
+            if rec.done.wait(0.001):
+                break
+            with self._lock:
+                if rec.interrupt_injected:
+                    outcome = "injected_later"
+                elif self._inject_if_safe_locked(rec):
+                    outcome = "injected"
+                elif rec.status is not JobStatus.RUNNING or rec.worker_ident is None:
+                    break
+        if outcome == "injected":
             self._log(logging.WARNING, rec, "INTERRUPT: raised JobInterrupted in the job's thread")
-        elif rec.interrupt_requested and not rec.interrupt_injected:
-            self._log(logging.WARNING, rec, "INTERRUPT: the job will stop before its function runs")
-        elif rec.status is JobStatus.RUNNING and not INTERRUPT_SUPPORTED:
+        elif outcome == "preempted":
+            self._log(
+                logging.WARNING,
+                rec,
+                "INTERRUPT: requested while the job function was not executing; "
+                "it will not be (re)started",
+            )
+        elif outcome == "pending":
+            self._log(
+                logging.WARNING,
+                rec,
+                "INTERRUPT: pending; the job is inside logging/threading code (e.g. waiting "
+                "on an Event, queue or lock) and is interrupted as soon as it returns to its "
+                "own code",
+            )
+        elif outcome == "unsupported":
             self._log(
                 logging.WARNING,
                 rec,
                 f"interrupt() is not supported on {platform.python_implementation()}; "
                 "only cooperative cancellation was requested",
             )
-        if timeout != 0:
-            rec.done.wait(timeout)
+        if deadline is None:
+            rec.done.wait()
+        else:
+            rec.done.wait(max(0.0, deadline - time.monotonic()))
         with self._lock:
             status = rec.status
         if not status.is_terminal:
@@ -1410,6 +1521,57 @@ class JobManager:
                 "It stops when that call returns; register sidejob.on_cancel(...) to abort it.",
             )
         return status
+
+    def _inject_if_safe_locked(self, rec: _JobRecord) -> bool:
+        """Raise JobInterrupted in the job's thread if it is at a safe point (lock held).
+
+        Nothing here may block or log, so the target thread cannot move into
+        lock-sensitive code between the safe-point check and the injection.
+        """
+        ident = rec.worker_ident
+        if (
+            rec.status is not JobStatus.RUNNING
+            or rec.interrupt_injected
+            or ident is None
+            or not _at_safe_point(ident)
+            or _async_raise(ident, JobInterrupted) != 1
+        ):
+            return False
+        rec.interrupt_injected = True
+        self._add_event(rec, "interrupted", "JobInterrupted raised in the job's thread")
+        return True
+
+    def _try_interrupt_locked(self, rec: _JobRecord) -> str:
+        """First interrupt attempt (lock held).
+
+        Returns "injected", "preempted", "pending", "unsupported" or "not_running".
+        """
+        if rec.status is not JobStatus.RUNNING:
+            return "not_running"
+        if not INTERRUPT_SUPPORTED:
+            return "unsupported"
+        rec.interrupt_requested = True
+        if rec.interrupt_injected or self._inject_if_safe_locked(rec):
+            return "injected"
+        if rec.worker_ident is None:
+            return "preempted"  # the function isn't executing; it won't be started
+        # Keep trying in the background until the job is back in its own code.
+        rec.interrupt_polls = 0
+        self._schedule_locked(time.monotonic() + 0.002, "interrupt", rec)
+        return "pending"
+
+    def _retry_interrupt(self, rec: _JobRecord) -> None:
+        """Scheduler: retry a pending interrupt (2ms polls for ~2s, then up to 50ms)."""
+        with self._lock:
+            if rec.status is not JobStatus.RUNNING or rec.interrupt_injected:
+                return
+            injected = self._inject_if_safe_locked(rec)
+            if not injected and rec.worker_ident is not None:
+                rec.interrupt_polls += 1
+                delay = 0.002 if rec.interrupt_polls < 1000 else 0.05
+                self._schedule_locked(time.monotonic() + delay, "interrupt", rec)
+        if injected:
+            self._log(logging.WARNING, rec, "INTERRUPT: raised JobInterrupted in the job's thread")
 
     def job(self, job_id: str) -> Job:
         """Get a :class:`Job` handle from a job ID, e.g. ``manager.job(id).interrupt()``."""
@@ -1562,6 +1724,9 @@ class JobManager:
             f"JobManager(name={self.name!r}, max_workers={self._max_workers}, jobs={n}, "
             f"shutdown={self._closed})"
         )
+
+
+_INVOKE_CODE = JobManager._invoke.__code__
 
 
 def _normalize_statuses(status: StatusFilter) -> Optional[FrozenSet[JobStatus]]:
